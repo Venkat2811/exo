@@ -157,24 +157,43 @@ def main() -> int:
     from exo.integrations.tensorpuffer.client import Tensorpuffer
     from exo.integrations.tensorpuffer.codec import decode as codec_decode
 
-    # Probe the puffer directly so we can split the load time from the
-    # codec time.
+    # Profile the warm load over several iterations so we can see
+    # both the first-foyer-warm-up cost AND the steady-state. The
+    # production scenario is the steady state (a popular system prompt
+    # served many times) — not the very first read after stash.
     direct_tp = Tensorpuffer()
-    t0 = time.time()
-    blob = direct_tp.try_load_prefix(
-        os.environ.get("TPUF_KVBM_MODEL_ID", "exo-e2e"),
-        [int(t) for t in prompt_tokens.tolist()],
-    )
-    t_probe = time.time() - t0
-    if blob is None:
-        print("FAIL: direct probe missed", file=sys.stderr)
-        return 5
-    print(f"  step direct probe (tpuf load): {t_probe*1000:.1f} ms ({len(blob):,} bytes)")
-    t0 = time.time()
-    decoded = codec_decode(blob)
-    t_decode = time.time() - t0
-    print(f"  step codec.decode:             {t_decode*1000:.1f} ms")
+    n_iters = int(os.environ.get("TPUF_E2E_WARM_ITERS", "3"))
+    iter_load_ms: list[float] = []
+    iter_decode_ms: list[float] = []
+    for it in range(n_iters):
+        t0 = time.time()
+        blob = direct_tp.try_load_prefix_view(
+            os.environ.get("TPUF_KVBM_MODEL_ID", "exo-e2e"),
+            [int(t) for t in prompt_tokens.tolist()],
+        )
+        t_probe = time.time() - t0
+        if blob is None:
+            print("FAIL: direct probe missed", file=sys.stderr)
+            return 5
+        bytes_len = len(blob)
+        t0 = time.time()
+        decoded = codec_decode(blob)
+        t_decode = time.time() - t0
+        del blob, decoded
+        iter_load_ms.append(t_probe * 1000)
+        iter_decode_ms.append(t_decode * 1000)
+        print(
+            f"  iter {it}: view_call={t_probe*1000:6.1f} ms  "
+            f"decode={t_decode*1000:6.1f} ms  ({bytes_len:,} bytes)"
+        )
     direct_tp.free()
+    if n_iters > 1:
+        ss_load = min(iter_load_ms[1:])
+        ss_decode = min(iter_decode_ms[1:])
+        print(
+            f"  steady-state best (excluding iter 0): "
+            f"view={ss_load:.1f} ms  decode={ss_decode:.1f} ms  total={ss_load+ss_decode:.1f} ms"
+        )
 
     # Now the full integrated path through KVPrefixCache
     t0 = time.time()

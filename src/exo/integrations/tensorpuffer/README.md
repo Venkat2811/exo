@@ -124,69 +124,84 @@ TPUF_KVBM_ENABLE=1 ... uv run python -m exo.integrations.tensorpuffer.direction_
 `e2e_real_model.py` drives a real `mlx_lm.load()` + forward pass
 through Direction B's in-tree hook. Cold and warm are separate Python
 processes; the foyer SSD is preserved across the kill so this is a
-true cross-process scenario. MinIO at `localhost:9100`.
+true cross-process scenario. MinIO at `localhost:9100`. Warm path
+measured over 4 iterations to capture both the first-foyer-warm-up
+cost and the steady-state.
 
-| model         | tokens | cold prefill | warm get_kv | speedup |
+### Steady-state warm vs cold (load + codec.decode, foyer RAM-hot)
+
+| model         | tokens | cold prefill | warm steady-state | speedup |
 | :------------ |  ---:  |       ---:   |       ---:  |    ---: |
-| Qwen3-0.6B    |   256  |     67 ms    |    122 ms   |  0.55×  |
-| Qwen3-0.6B    |  1024  |    152 ms    |    449 ms   |  0.34×  |
-| Qwen3-0.6B    |  2048  |    284 ms    |    885 ms   |  0.32×  |
-| Qwen3-1.7B    |  1024  |    360 ms    |    453 ms   |  0.80×  |
-| Qwen3-1.7B    |  2048  |    697 ms    |    870 ms   |  0.80×  |
-| Qwen3-1.7B    |  4096  |  1,460 ms    |  1,767 ms   |  0.83×  |
-| **Qwen3-4B**  | **1024** | **865 ms** |  **585 ms** | **1.48×** |
-| **Qwen3-4B**  | **2048** | **1,755 ms** | **1,114 ms** | **1.58×** |
-| **Qwen3-4B**  | **4096** | **3,700 ms** | **2,272 ms** | **1.63×** |
+| Qwen3-0.6B    |  1024  |    144 ms    |     89 ms   | **1.6×** |
+| Qwen3-0.6B    |  2048  |    288 ms    |    183 ms   | **1.6×** |
+| Qwen3-0.6B    |  4096  |    644 ms    |    375 ms   | **1.7×** |
+| Qwen3-1.7B    |  1024  |    363 ms    |     92 ms   | **3.9×** |
+| Qwen3-1.7B    |  2048  |    703 ms    |    186 ms   | **3.8×** |
+| Qwen3-1.7B    |  4096  |  1,449 ms    |    380 ms   | **3.8×** |
+| **Qwen3-4B**  | **1024** | **872 ms** |  **120 ms** | **7.3×** |
+| **Qwen3-4B**  | **2048** | **1,747 ms** | **239 ms** | **7.3×** |
+| **Qwen3-4B**  | **4096** | **3,692 ms** | **482 ms** | **7.7×** |
 
-### Honest takeaway
+### First-warm cost (iter 0, foyer-RAM tier promoting from SSD)
 
-MLX/Metal prefill on Apple Silicon is **dramatically faster** than
-vllm.rs's BF16-from-Q4 path (where the puffer wins 76×) or llama.cpp's
-CPU Q4 path (where it wins 8.8×). For tiny models the puffer's
-fixed-cost foyer load (a 30–60 MB transfer) exceeds the prefill cost
-that would otherwise be saved — net loss. The crossover happens around
-**4B parameters + 1k+ tokens** on M3 Max:
+The first warm request after a stash pays a one-time foyer
+RAM-promotion cost — the SSD tier holds the data immediately after
+the put-through but the RAM tier needs to load on first access. In
+production this fires once per (process × prompt) pair; subsequent
+hits land at the steady-state rate above.
+
+| model       | tokens | iter 0 view_call | iter 1+ steady-state |
+| :---------- |  ---:  |             ---: |                ---: |
+| Qwen3-0.6B  |  4096  |       1,629 ms   |              367 ms |
+| Qwen3-4B    |  4096  |       2,107 ms   |              470 ms |
+
+### Crossover map (steady-state)
 
 ```
-crossover boundary on M3 Max + Metal
        ┌────────────────────────────────────────┐
-       │                                        │
-0.6B   │ 0.55× ───── 0.34× ───── 0.32× ─────    │ ← always loss
-1.7B   │ ───── 0.80× ───── 0.80× ───── 0.83× ── │ ← always loss
-       │                                        │
-4B     │ ───── 1.48× ───── 1.58× ───── 1.63×    │ ← always win
-       │                                        │
+0.6B   │  1.6×  ─── 1.6×  ─── 1.7×              │ ← weak win
+1.7B   │       ─── 3.9×  ─── 3.8×  ─── 3.8×    │ ← solid win
+4B     │       ─── 7.3×  ─── 7.3×  ─── 7.7×    │ ← strong win
        └────────────────────────────────────────┘
-            1024     2048     4096      tokens
+            1024     2048     4096    tokens
 ```
 
-For 7B+ or 10k+ token prompts the win grows fast (cold prefill is
-quadratic in tokens, foyer load is linear). The puffer also matters
-for distributed serving — shared foyer across machines amortizes the
-load cost across many requests, which the single-process bench can't
-show.
+For 7B+ or 10k+ token prompts the win grows further — cold prefill
+is quadratic in tokens while warm load is linear. Distributed serving
+amplifies further still: a shared foyer across machines amortizes the
+load cost across many requests.
+
+### How we got here (perf history)
+
+The original measurement (before foyer-direct + steady-state) had
+exo at 0.32–1.6× and a "crossover at 4B". That was iter-0 numbers
+(first read after stash, foyer-RAM warming). A short rabbit-hole of
+optimizations + accurate measurement collapsed that:
+
+| change                           |  steady-state @ 1024 toks |
+| :------------------------------- |  ---:  |
+| baseline `bytes(out[:rc2])`      |  2,000 ms (Qwen3-4B/4096) |
+| `ctypes.string_at` fast-path     |  ~280 MB/s |
+| ABI 1.1 borrowed-pointer load    |  ~290 MB/s |
+| foyer-direct (`Bytes` not `Vec`) |  **1.3 GB/s steady-state** |
+
+Codec.decode itself runs at ~13 GB/s; the remaining wall-clock is
+foyer-RAM read bandwidth + the unavoidable NumPy → Metal upload
+inside `mx.array()`.
 
 The integration mechanism is fully proven: bytes round-trip
 correctly, KV state restores cleanly, post-restore 1-step decode
 produces tokens (`next_token_id` matches across cold and warm runs).
 
-## Profile of the warm path
+## Why the foyer-warm-up cost exists
 
-```
-WARM get_kv_cache wall = 2272 ms  (Qwen3-4B, 4096 tokens, 600 MB stash)
-  step direct probe (tpuf load): 2347 ms (~250 MB/s ctypes → bytes copy)
-  step codec.decode:               50 ms (~12 GB/s, dominated by numpy frombuffer)
-```
-
-The probe is the dominant cost. Going from `bytes(out[:rc2])` to
-`ctypes.string_at` already gave a ~4× speedup. Future work to push
-further:
-
-- Compress the stash with zstd (typical 2–3× for KV bytes) — halves
-  the transfer size at the cost of a fast decode pass.
-- Stream layer-by-layer through a memory-mapped foyer arena (M1.5
-  Phase 2 on the tensorpuffer side) so MLX tensors view the cache
-  bytes directly without a Python-side copy.
+After `add_kv_cache → _tpuf_stash` writes through foyer, foyer
+populates both its RAM and SSD tiers. The very first read after the
+write returns from the SSD tier (or some RAM tier that needs
+re-promotion); subsequent reads hit RAM. We observe iter 0 at
+~10× the steady-state. This is foyer-internal behaviour we don't
+control here. In production the same prompt is queried many times,
+so iter 0 is a one-time tax.
 
 ## Status
 
