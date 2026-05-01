@@ -244,7 +244,23 @@ class KVPrefixCache:
         # Lazy-import so the module loads cleanly when the dylib is absent.
         # Off by default; enable with TPUF_KVBM_ENABLE=1.
         self._tpuf = None
-        self._tpuf_model_id = os.environ.get("TPUF_KVBM_MODEL_ID", "exo-mlx")
+        # Distributed correctness: when running tensor-parallel each
+        # shard holds a different slice of K/V. Suffix the puffer's
+        # content-hash namespace with the rank+world so two shards
+        # never clobber each other in S3. Single-device path keeps the
+        # plain model_id (group is None → rank 0, world 1).
+        base_model_id = os.environ.get("TPUF_KVBM_MODEL_ID", "exo-mlx")
+        rank, world = 0, 1
+        if group is not None:
+            try:
+                rank = int(group.rank())
+                world = int(group.size())
+            except Exception:  # noqa: BLE001
+                pass
+        if world > 1:
+            self._tpuf_model_id = f"{base_model_id}::r{rank}of{world}"
+        else:
+            self._tpuf_model_id = base_model_id
         try:
             from exo.integrations.tensorpuffer import Tensorpuffer, is_enabled
 
@@ -342,7 +358,11 @@ class KVPrefixCache:
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
         # Stash to tensorpuffer (best-effort; codec returns None for
         # unsupported cache flavours and we silently skip those).
-        self._tpuf_stash(prompt_tokens, cache)
+        # Skip on multimodal: codec doesn't yet serialize MediaRegion
+        # and the prompt-token hash alone is insufficient when the
+        # cached state depends on attached image/audio embeddings.
+        if not (media_regions or []):
+            self._tpuf_stash(prompt_tokens, cache)
 
     def update_kv_cache(
         self,
@@ -370,6 +390,13 @@ class KVPrefixCache:
         self._access_counter += 1
         self._last_used[index] = self._access_counter
         logger.info(f"KV cache updated (index {index}): {len(prompt_tokens)} tokens")
+        # Stash the updated state too so future processes can warm-start
+        # from continuation cases (partial-prefix match + new suffix
+        # prefill, decode-extended caches via callers in
+        # generator/{generate,batch_generate}.py and disaggregated/serve.py).
+        # Same posture as add_kv_cache — best-effort, no-op without media.
+        if not (media_regions or []):
+            self._tpuf_stash(prompt_tokens, cache)
 
     def _get_snapshot(
         self, entry_index: int, target_token_count: int
