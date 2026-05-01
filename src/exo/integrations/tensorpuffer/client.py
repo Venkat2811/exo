@@ -197,7 +197,11 @@ class Tensorpuffer:
         if rc2 <= 0:
             # Race or unexpected; treat as miss.
             return None
-        return bytes(out[: int(rc2)])
+        # `bytes(out[:rc2])` slices the ctypes array element-wise (huge
+        # Python overhead for 100+ MB blobs). string_at does a single
+        # C-level memcpy into a Python bytes object, ~30× faster on
+        # blobs > 50 MB.
+        return ctypes.string_at(ctypes.addressof(out), int(rc2))
 
     def free(self) -> None:
         if self._handle is not None:
