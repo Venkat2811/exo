@@ -240,6 +240,24 @@ class KVPrefixCache:
         self._access_counter: int = 0
         self._group = group
 
+        # Tensorpuffer integration (Direction B, in-tree).
+        # Lazy-import so the module loads cleanly when the dylib is absent.
+        # Off by default; enable with TPUF_KVBM_ENABLE=1.
+        self._tpuf = None
+        self._tpuf_model_id = os.environ.get("TPUF_KVBM_MODEL_ID", "exo-mlx")
+        try:
+            from exo.integrations.tensorpuffer import Tensorpuffer, is_enabled
+
+            if is_enabled():
+                self._tpuf = Tensorpuffer()
+                logger.info(
+                    f"[tpuf] KVPrefixCache: tensorpuffer enabled, "
+                    f"model_id={self._tpuf_model_id}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[tpuf] init failed (falling back): {exc}")
+            self._tpuf = None
+
     def clear(self):
         """Clear all cached prompts and caches."""
         self.prompts.clear()
@@ -248,6 +266,61 @@ class KVPrefixCache:
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+
+    def _tpuf_tokens(self, prompt_tokens: mx.array) -> list[int]:
+        """Materialize an mx token array as a Python list[int] for the
+        content-hash key. Cheap on small prompts; for very long prompts
+        the tolist() cost is dominated by the actual stash/load anyway.
+        """
+        return [int(t) for t in prompt_tokens.tolist()]
+
+    def _tpuf_stash(
+        self, prompt_tokens: mx.array, cache: KVCacheType
+    ) -> None:
+        """Best-effort stash to tensorpuffer. Silent on miss / error."""
+        if self._tpuf is None:
+            return
+        try:
+            from exo.integrations.tensorpuffer.codec import encode
+
+            blob = encode(cache)  # type: ignore[arg-type]
+            if blob is None:
+                # Unsupported cache shape (RotatingKV / SSM / DeepseekV4 / …)
+                return
+            tokens = self._tpuf_tokens(prompt_tokens)
+            n = self._tpuf.stash_prefix(self._tpuf_model_id, tokens, blob)
+            logger.info(
+                f"[tpuf] stashed {n:,} bytes for {len(tokens)}-token prompt"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[tpuf] stash failed (continuing): {exc}")
+
+    def _tpuf_try_load(
+        self, prompt_tokens: mx.array
+    ) -> KVCacheType | None:
+        """Probe tensorpuffer for an exact-match prefix. Returns the
+        decoded KV cache list on hit, ``None`` on miss / unsupported.
+        """
+        if self._tpuf is None:
+            return None
+        try:
+            from exo.integrations.tensorpuffer.codec import decode
+
+            tokens = self._tpuf_tokens(prompt_tokens)
+            blob = self._tpuf.try_load_prefix(self._tpuf_model_id, tokens)
+            if blob is None:
+                return None
+            cache = decode(blob)
+            if cache is None:
+                # Magic / version mismatch — treat as miss
+                return None
+            logger.info(
+                f"[tpuf] loaded {len(blob):,} bytes for {len(tokens)}-token prompt"
+            )
+            return cache  # type: ignore[return-value]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[tpuf] load failed (falling through): {exc}")
+            return None
 
     def add_kv_cache(
         self,
@@ -267,6 +340,9 @@ class KVPrefixCache:
         self._access_counter += 1
         self._last_used.append(self._access_counter)
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
+        # Stash to tensorpuffer (best-effort; codec returns None for
+        # unsupported cache flavours and we silently skip those).
+        self._tpuf_stash(prompt_tokens, cache)
 
     def update_kv_cache(
         self,
@@ -336,6 +412,36 @@ class KVPrefixCache:
         """
         max_length = len(prompt_tokens)
         query_regions = media_regions or []
+
+        # Tensorpuffer fast-path: before the in-memory linear scan, probe
+        # the puffer for an exact match. On hit, decode the KV cache,
+        # promote it to the in-memory list (so subsequent calls skip the
+        # decode), and return as a normal exact match. Misses fall
+        # through to the existing prefix-match logic. Multi-modal queries
+        # currently route around the puffer (the codec doesn't yet
+        # serialize MediaRegion).
+        if self._tpuf is not None and not query_regions:
+            puffer_cache = self._tpuf_try_load(prompt_tokens)
+            if puffer_cache is not None:
+                self._evict_if_needed()
+                self.prompts.append(prompt_tokens)
+                self.caches.append(puffer_cache)
+                self._snapshots.append(None)
+                self._media_regions.append([])
+                self.prefill_tps.append(0.0)
+                self._access_counter += 1
+                self._last_used.append(self._access_counter)
+                idx = len(self.prompts) - 1
+                # stream_generate needs ≥1 token of remaining prompt to
+                # produce the first decode logits — return the last
+                # token, same convention the in-memory exact-match path
+                # uses below.
+                remaining = prompt_tokens[max_length - 1 :]
+                logger.info(
+                    f"[tpuf] hit (exact) for {max_length}-token prompt; "
+                    f"promoted to in-memory entry {idx}"
+                )
+                return puffer_cache, remaining, idx, True
 
         best_index: int | None = None
         best_length = 0
