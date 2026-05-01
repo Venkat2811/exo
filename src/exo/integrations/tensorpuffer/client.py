@@ -68,7 +68,13 @@ class LoadedBlob:
         self._len = length
         self._lib = lib
         self._borrow_handle = borrow_handle
-        self.memoryview = memoryview(buf)[:length]
+        # `memoryview(ctypes_array)` inherits ctypes' format string,
+        # which on foreign-pointer-backed (c_uint8 * N).from_address
+        # arrays is sometimes "<B" (with the byte-order prefix) — that
+        # confuses scalar indexing (`mv[i]` raises NotImplementedError).
+        # `.cast('B')` normalizes to a plain unsigned-char view; it's
+        # zero-copy because both views point at the same memory.
+        self.memoryview = memoryview(buf)[:length].cast("B")
         self.numpy_view = None  # lazy
 
     def __len__(self) -> int:
