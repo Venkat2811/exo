@@ -33,31 +33,43 @@ class TensorpufferError(RuntimeError):
 
 
 class LoadedBlob:
-    """Buffer-protocol wrapper around a ctypes-allocated load buffer.
+    """Buffer-protocol wrapper around a load buffer.
 
-    Holds the ctypes ``(c_uint8 * N)`` array alive for the lifetime of
-    the wrapper so consumers can decode through ``memoryview`` /
-    ``np.frombuffer`` without the ``string_at`` memcpy that
-    :meth:`Tensorpuffer.try_load_prefix` performs.
+    Two backing modes:
 
-    Compression (TPC1 envelope) is handled inside the C ABI — the
-    bytes returned here are already decompressed when the codec at
-    stash time was Lz4 / Zstd.
+    1. **Owned** (legacy path): wraps a Python-allocated ctypes
+       ``(c_uint8 * N)`` array we copied bytes into via
+       ``tpuf_try_load_prefix(out_buf, cap)``. Drops with the wrapper.
 
-    Slicing returns ``memoryview`` slices, which themselves don't copy.
-    Iteration / ``__len__`` / ``__getitem__`` all delegate to the
-    inner memoryview.
+    2. **Borrowed** (ABI 1.1+): wraps a foreign pointer into a Vec
+       owned by an opaque ``tpuf_borrow`` handle from
+       ``tpuf_try_load_prefix_borrowed``. We call
+       ``tpuf_release_borrow`` on ``__del__`` so the Vec stays alive
+       for as long as Python holds the wrapper.
+
+    Mode 2 saves a ~100 MB memcpy on every warm load by letting Python
+    read directly from the foyer-decompressed bytes that the C ABI
+    would otherwise copy into ``out_buf``.
+
+    Either way the API is the same: ``len(blob)``, ``blob.memoryview``,
+    ``blob.as_numpy_uint8()``.
     """
 
-    __slots__ = ("_buf", "_len", "memoryview", "numpy_view")
+    __slots__ = ("_buf", "_len", "_lib", "_borrow_handle", "memoryview", "numpy_view")
 
-    def __init__(self, buf, length: int) -> None:
+    def __init__(
+        self,
+        buf,
+        length: int,
+        lib=None,
+        borrow_handle: int | None = None,
+    ) -> None:
         self._buf = buf
         self._len = length
+        self._lib = lib
+        self._borrow_handle = borrow_handle
         self.memoryview = memoryview(buf)[:length]
-        # Lazy: only build the numpy view if asked. memoryview is enough
-        # for struct.unpack_from + np.frombuffer.
-        self.numpy_view = None
+        self.numpy_view = None  # lazy
 
     def __len__(self) -> int:
         return self._len
@@ -68,6 +80,16 @@ class LoadedBlob:
         if self.numpy_view is None:
             self.numpy_view = np.frombuffer(self._buf, dtype=np.uint8, count=self._len)
         return self.numpy_view
+
+    def __del__(self) -> None:
+        # Release any foreign-borrow handle. Owned-mode buffers (mode 1)
+        # are GC'd automatically — there's nothing to release.
+        if self._borrow_handle is not None and self._lib is not None:
+            try:
+                self._lib.tpuf_release_borrow(ctypes.c_void_p(self._borrow_handle))
+            except Exception:
+                pass
+            self._borrow_handle = None
 
 
 def _candidate_dylib_paths() -> Iterable[Path]:
@@ -145,6 +167,25 @@ def _bind_symbols(lib: ctypes.CDLL) -> None:
     lib.tpuf_last_error.restype = ctypes.c_char_p
     lib.tpuf_last_error.argtypes = []
 
+    # ABI 1.1+: zero-copy borrowed load. Older dylibs may not have
+    # these symbols; we probe for them and fall back gracefully.
+    try:
+        lib.tpuf_try_load_prefix_borrowed.restype = ctypes.c_int32
+        lib.tpuf_try_load_prefix_borrowed.argtypes = [
+            ctypes.c_void_p,                                  # handle
+            ctypes.c_char_p,                                  # model_id
+            ctypes.POINTER(ctypes.c_uint32),                  # tokens
+            ctypes.c_size_t,                                  # n_tokens
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),   # *out_ptr
+            ctypes.POINTER(ctypes.c_size_t),                  # *out_len
+            ctypes.POINTER(ctypes.c_void_p),                  # *out_borrow
+        ]
+        lib.tpuf_release_borrow.restype = None
+        lib.tpuf_release_borrow.argtypes = [ctypes.c_void_p]
+        lib._tpuf_has_borrow = True
+    except AttributeError:
+        lib._tpuf_has_borrow = False
+
 
 def is_enabled() -> bool:
     """``True`` iff ``TPUF_KVBM_ENABLE=1`` and the dylib is loadable."""
@@ -215,20 +256,52 @@ class Tensorpuffer:
     ) -> "LoadedBlob | None":
         """Zero-copy variant of :meth:`try_load_prefix`.
 
-        Returns a :class:`LoadedBlob` whose ``.memoryview`` /
-        ``.numpy_view`` exposes the ctypes-allocated buffer directly,
-        without the ~100 MB ``string_at`` memcpy. The :class:`LoadedBlob`
-        keeps the ctypes array alive for as long as the caller holds a
-        reference, so the views stay valid.
+        Uses the C ABI's borrowed-pointer path
+        (``tpuf_try_load_prefix_borrowed``) when available — Python
+        reads the foyer-decompressed bytes directly, no per-call
+        ~100 MB memcpy. Falls back to the legacy probe-allocate-copy
+        path (``tpuf_try_load_prefix``) on older dylibs.
 
-        Decoders should use ``np.frombuffer(blob.memoryview, ...)`` or
-        ``struct.unpack_from(fmt, blob.memoryview, off)`` — both are
-        zero-copy on the buffer protocol.
+        Returns a :class:`LoadedBlob` whose ``.memoryview`` /
+        ``.as_numpy_uint8()`` views are valid for the lifetime of the
+        wrapper.
         """
         if self._handle is None:
             raise TensorpufferError("Tensorpuffer handle is closed")
         toks_arr = self._tokens_array(token_ids)
-        # First probe with a zero-size buffer to learn the actual blob size.
+
+        if getattr(self._lib, "_tpuf_has_borrow", False):
+            # ABI 1.1+ zero-copy path
+            out_ptr = ctypes.POINTER(ctypes.c_uint8)()
+            out_len = ctypes.c_size_t(0)
+            out_borrow = ctypes.c_void_p(0)
+            rc = self._lib.tpuf_try_load_prefix_borrowed(
+                ctypes.c_void_p(self._handle),
+                model_id.encode("utf-8"),
+                toks_arr,
+                len(toks_arr),
+                ctypes.byref(out_ptr),
+                ctypes.byref(out_len),
+                ctypes.byref(out_borrow),
+            )
+            if rc == 0:
+                return None
+            if rc < 0:
+                raise TensorpufferError(
+                    self._last_error() or "tpuf_try_load_prefix_borrowed error"
+                )
+            size = int(out_len.value)
+            if size <= 0:
+                return None
+            # Wrap the foreign pointer as a Python buffer. We use ctypes
+            # to read the address back as a sized array; from_address
+            # does NOT take ownership, which is what we want — the Vec
+            # is owned by out_borrow until tpuf_release_borrow drops it.
+            addr = ctypes.addressof(out_ptr.contents)
+            arr = (ctypes.c_uint8 * size).from_address(addr)
+            return LoadedBlob(arr, size, lib=self._lib, borrow_handle=out_borrow.value)
+
+        # Legacy ABI 1.0 path: probe + allocate + copy
         probe = (ctypes.c_uint8 * 0)()
         rc = self._lib.tpuf_try_load_prefix(
             ctypes.c_void_p(self._handle),
