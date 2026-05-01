@@ -32,6 +32,44 @@ class TensorpufferError(RuntimeError):
     """Raised on any unexpected condition from the C ABI."""
 
 
+class LoadedBlob:
+    """Buffer-protocol wrapper around a ctypes-allocated load buffer.
+
+    Holds the ctypes ``(c_uint8 * N)`` array alive for the lifetime of
+    the wrapper so consumers can decode through ``memoryview`` /
+    ``np.frombuffer`` without the ``string_at`` memcpy that
+    :meth:`Tensorpuffer.try_load_prefix` performs.
+
+    Compression (TPC1 envelope) is handled inside the C ABI — the
+    bytes returned here are already decompressed when the codec at
+    stash time was Lz4 / Zstd.
+
+    Slicing returns ``memoryview`` slices, which themselves don't copy.
+    Iteration / ``__len__`` / ``__getitem__`` all delegate to the
+    inner memoryview.
+    """
+
+    __slots__ = ("_buf", "_len", "memoryview", "numpy_view")
+
+    def __init__(self, buf, length: int) -> None:
+        self._buf = buf
+        self._len = length
+        self.memoryview = memoryview(buf)[:length]
+        # Lazy: only build the numpy view if asked. memoryview is enough
+        # for struct.unpack_from + np.frombuffer.
+        self.numpy_view = None
+
+    def __len__(self) -> int:
+        return self._len
+
+    def as_numpy_uint8(self):
+        import numpy as np
+
+        if self.numpy_view is None:
+            self.numpy_view = np.frombuffer(self._buf, dtype=np.uint8, count=self._len)
+        return self.numpy_view
+
+
 def _candidate_dylib_paths() -> Iterable[Path]:
     override = os.environ.get("TPUF_DYLIB_PATH")
     if override:
@@ -161,8 +199,31 @@ class Tensorpuffer:
     def try_load_prefix(self, model_id: str, token_ids: list[int] | bytes) -> bytes | None:
         """Return the stashed bytes for ``(model_id, token_ids)`` or ``None`` on miss.
 
-        Implements the standard "probe size, allocate, retry" dance the C
-        ABI documents under return code -2.
+        Backwards-compatible wrapper that materializes the full blob into a
+        Python ``bytes`` object via a single C-level memcpy. For warm-path
+        latency-sensitive callers prefer :meth:`try_load_prefix_view`,
+        which returns a buffer-protocol object that the codec can decode
+        without any Python-side copy of the 100+ MB blob.
+        """
+        view = self.try_load_prefix_view(model_id, token_ids)
+        if view is None:
+            return None
+        return ctypes.string_at(ctypes.addressof(view._buf), len(view))
+
+    def try_load_prefix_view(
+        self, model_id: str, token_ids: list[int] | bytes
+    ) -> "LoadedBlob | None":
+        """Zero-copy variant of :meth:`try_load_prefix`.
+
+        Returns a :class:`LoadedBlob` whose ``.memoryview`` /
+        ``.numpy_view`` exposes the ctypes-allocated buffer directly,
+        without the ~100 MB ``string_at`` memcpy. The :class:`LoadedBlob`
+        keeps the ctypes array alive for as long as the caller holds a
+        reference, so the views stay valid.
+
+        Decoders should use ``np.frombuffer(blob.memoryview, ...)`` or
+        ``struct.unpack_from(fmt, blob.memoryview, off)`` — both are
+        zero-copy on the buffer protocol.
         """
         if self._handle is None:
             raise TensorpufferError("Tensorpuffer handle is closed")
@@ -181,7 +242,6 @@ class Tensorpuffer:
             return None
         if rc == -1:
             raise TensorpufferError(self._last_error() or "tpuf_try_load_prefix error")
-        # rc < 0  →  -size_required.   rc > 0  →  fits in zero-cap (impossible)
         size = -rc if rc < 0 else rc
         if size <= 0:
             return None
@@ -195,13 +255,8 @@ class Tensorpuffer:
             size,
         )
         if rc2 <= 0:
-            # Race or unexpected; treat as miss.
             return None
-        # `bytes(out[:rc2])` slices the ctypes array element-wise (huge
-        # Python overhead for 100+ MB blobs). string_at does a single
-        # C-level memcpy into a Python bytes object, ~30× faster on
-        # blobs > 50 MB.
-        return ctypes.string_at(ctypes.addressof(out), int(rc2))
+        return LoadedBlob(out, int(rc2))
 
     def free(self) -> None:
         if self._handle is not None:

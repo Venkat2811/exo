@@ -316,6 +316,10 @@ class KVPrefixCache:
     ) -> KVCacheType | None:
         """Probe tensorpuffer for an exact-match prefix. Returns the
         decoded KV cache list on hit, ``None`` on miss / unsupported.
+
+        Uses the zero-copy ``try_load_prefix_view`` path — the codec
+        decodes through a memoryview of the ctypes buffer instead of
+        re-copying the 100+ MB blob into a Python ``bytes`` object.
         """
         if self._tpuf is None:
             return None
@@ -323,7 +327,7 @@ class KVPrefixCache:
             from exo.integrations.tensorpuffer.codec import decode
 
             tokens = self._tpuf_tokens(prompt_tokens)
-            blob = self._tpuf.try_load_prefix(self._tpuf_model_id, tokens)
+            blob = self._tpuf.try_load_prefix_view(self._tpuf_model_id, tokens)
             if blob is None:
                 return None
             cache = decode(blob)

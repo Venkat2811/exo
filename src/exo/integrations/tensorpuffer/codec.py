@@ -109,7 +109,10 @@ def _array_to_numpy(a: "mx.array") -> np.ndarray:
     return np.array(a)
 
 
-def _numpy_to_array(buf: bytes, dtype_code: int, shape: Tuple[int, ...]) -> "mx.array":
+def _numpy_to_array(buf, dtype_code: int, shape: Tuple[int, ...]) -> "mx.array":
+    """`buf` may be bytes, memoryview, or any buffer-protocol object;
+    np.frombuffer is zero-copy across all of them.
+    """
     import mlx.core as mx
 
     name = _DTYPE_FROM_CODE[dtype_code]
@@ -193,10 +196,14 @@ def encode(cache: List[Optional[object]]) -> Optional[bytes]:
 # ---------------------------------------------------------------------------
 
 
-def _read_tensor(blob: bytes, pos: int) -> tuple["mx.array", int]:
+def _read_tensor(blob, pos: int) -> tuple["mx.array", int]:
+    """`blob` is bytes / memoryview / numpy uint8 view — anything that
+    supports the buffer protocol and slicing.
+    """
     if pos + 2 > len(blob):
         raise ValueError("short read on tensor header")
-    dtype_code, ndim = blob[pos], blob[pos + 1]
+    dtype_code = int(blob[pos])
+    ndim = int(blob[pos + 1])
     pos += 2
     shape = struct.unpack_from(f"<{ndim}I", blob, pos)
     pos += 4 * ndim
@@ -207,13 +214,30 @@ def _read_tensor(blob: bytes, pos: int) -> tuple["mx.array", int]:
     return arr, pos
 
 
-def decode(blob: bytes) -> Optional[List[Optional[object]]]:
+def decode(blob) -> Optional[List[Optional[object]]]:
     """Inverse of :func:`encode`. Returns ``None`` if the magic / version
     don't match (caller should treat as miss + fall through).
+
+    Accepts ``bytes``, ``memoryview``, ``LoadedBlob`` (its memoryview),
+    or any other buffer-protocol object. Buffer-protocol inputs avoid
+    the ~100 MB Python copy that ``bytes(...)`` would force — important
+    for warm-load latency.
     """
     from mlx_lm.models.cache import KVCache, RotatingKVCache  # local import — heavy
 
-    if len(blob) < 12 or blob[:4] != _MAGIC:
+    # Normalize to a memoryview so slicing / __getitem__ are zero-copy.
+    if hasattr(blob, "memoryview"):
+        # LoadedBlob — already exposes a memoryview
+        blob = blob.memoryview
+    elif isinstance(blob, (bytes, bytearray)):
+        blob = memoryview(blob)
+    elif not isinstance(blob, memoryview):
+        try:
+            blob = memoryview(blob)
+        except TypeError:
+            return None
+
+    if len(blob) < 12 or bytes(blob[:4]) != _MAGIC:
         return None
     version, nlayers = struct.unpack_from("<II", blob, 4)
     if version != _VERSION:
